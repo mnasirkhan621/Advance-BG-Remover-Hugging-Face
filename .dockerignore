@@ -1,0 +1,20 @@
+# Exclude local virtual environment (we create a fresh one or use system python in Docker)
+venv/
+env/
+
+# Exclude compiled python files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Exclude large model weights (Download them at runtime or mount them to keep image small)
+# If you prefer baking them in, remove these lines.
+
+# Exclude git history
+.git/
+.gitignore
+
+# Exclude IDE settings
+.vscode/
+.idea/
