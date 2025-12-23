@@ -25,7 +25,9 @@ COPY requirements.txt .
 
 # 5. Install Python Dependencies
 # --no-cache-dir: Don't save downloaded files, saves space.
-RUN pip install --no-cache-dir -r requirements.txt
+# We explicitly install CPU-only PyTorch first to avoid downloading the huge CUDA version.
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu && \
+    pip install --no-cache-dir -r requirements.txt
 
 # 6. Copy Application Code
 # Now we copy the rest of your app code into the container.

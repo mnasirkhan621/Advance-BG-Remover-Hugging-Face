@@ -1,9 +1,11 @@
 import io
 import torch
 import numpy as np
+import logging
+import traceback
 from PIL import Image
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 from torchvision import transforms
 from safetensors.torch import load_file
 
@@ -11,6 +13,12 @@ from models.birefnet import BiRefNet
 from utils import check_state_dict
 
 from fastapi.middleware.cors import CORSMiddleware
+
+# =========================
+# Logging Config
+# =========================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # =========================
 # App
@@ -29,15 +37,37 @@ app.add_middleware(
 # Device
 # =========================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logger.info(f"Using device: {device}")
 
 # =========================
 # Load model ONCE
 # =========================
-model = BiRefNet(bb_pretrained=False).to(device).eval()
+try:
+    logger.info("Loading model architecture...")
+    model = BiRefNet(bb_pretrained=False).to(device).eval()
+    
+    # Check for quantized model first
+    import os
+    if os.path.exists("weights/quantized_model.pth") and device.type == 'cpu':
+        logger.info("Found quantized model 'weights/quantized_model.pth'. Loading...")
+        # Apply quantization stub structure
+        model = torch.quantization.quantize_dynamic(
+            model, {torch.nn.Linear}, dtype=torch.qint8
+        )
+        state_dict = torch.load("weights/quantized_model.pth", map_location=device)
+        model.load_state_dict(state_dict)
+        logger.info("Quantized model loaded successfully!")
+    else:
+        logger.info("Loading original weights...")
+        state_dict = load_file("weights/model.safetensors", device=str(device))
+        state_dict = check_state_dict(state_dict)
+        model.load_state_dict(state_dict)
+        logger.info("Original model loaded successfully!")
 
-state_dict = load_file("weights/model.safetensors", device=str(device))
-state_dict = check_state_dict(state_dict)
-model.load_state_dict(state_dict)
+except Exception as e:
+    logger.error(f"Error loading model: {e}")
+    traceback.print_exc()
+    # vital error, maybe exit or let it crash on request
 
 # =========================
 # Preprocessing
@@ -49,8 +79,6 @@ transform = transforms.Compose([
         std=[0.229, 0.224, 0.225],
     )
 ])
-
-import numpy as np
 
 MAX_SIDE = 1536
 DIVISOR = 32  # REQUIRED for BiRefNet
@@ -81,29 +109,48 @@ def smart_resize(img: Image.Image):
 # =========================
 @app.post("/remove-bg")
 async def remove_bg(file: UploadFile = File(...)):
-    img = Image.open(file.file).convert("RGB")
-    W, H = img.size
+    try:
+        logger.info(f"Received request for file: {file.filename}")
+        img = Image.open(file.file).convert("RGB")
+        W, H = img.size
+        logger.info(f"Original image size: {W}x{H}")
 
-    img_resized, _ = smart_resize(img)
+        img_resized, _ = smart_resize(img)
+        logger.info(f"Resized image size: {img_resized.size}")
 
-    x = transform(img_resized).unsqueeze(0).to(device)
+        x = transform(img_resized).unsqueeze(0).to(device)
+        logger.info("Input tensor created. Starting inference...")
 
-    with torch.no_grad():
-        preds = model(x)
-        mask = torch.sigmoid(preds[-1])[0, 0].cpu().numpy()
+        with torch.no_grad():
+            preds = model(x)
+            logger.info("Inference models(x) done.")
+            
+            # Helper to debug output structure if needed
+            if isinstance(preds, (list, tuple)):
+                 logger.info(f"Model output type: list/tuple of length {len(preds)}")
+            
+            mask = torch.sigmoid(preds[-1])[0, 0].cpu().numpy()
+            logger.info("Mask generated.")
 
-    # Resize mask back
-    mask = Image.fromarray((mask * 255).astype(np.uint8))
-    mask = mask.resize((W, H), Image.BICUBIC)
+        # Resize mask back
+        mask = Image.fromarray((mask * 255).astype(np.uint8))
+        mask = mask.resize((W, H), Image.BICUBIC)
+        logger.info("Mask resized to original dimensions.")
 
-    rgba = np.dstack([np.array(img), np.array(mask)])
-    out = Image.fromarray(rgba, "RGBA")
+        rgba = np.dstack([np.array(img), np.array(mask)])
+        out = Image.fromarray(rgba, "RGBA")
 
-    buf = io.BytesIO()
-    out.save(buf, format="PNG")
-    buf.seek(0)
+        buf = io.BytesIO()
+        out.save(buf, format="PNG")
+        buf.seek(0)
+        
+        logger.info("Returning response image.")
+        return StreamingResponse(buf, media_type="image/png")
 
-    return StreamingResponse(buf, media_type="image/png")
+    except Exception as e:
+        logger.error(f"Error processing request: {e}")
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"message": "Internal Server Error", "details": str(e)})
 
 if __name__ == "__main__":
     import uvicorn
